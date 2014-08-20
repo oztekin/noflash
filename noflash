@@ -1,0 +1,227 @@
+noflash_hide="<!--"/*        ## Active: bash ##
+###############################################################################
+#
+# Copyright (C) 2013  Bilgehan Uygar Oztekin
+# Licence: GPLv3
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+#
+# NoFlash. Watch online videos using mplayer, oxmplayer, quvi, youtube-dl etc.
+#
+# Developed on debian testing / firefox. No plans to support non-unix systems.
+#
+# Requires: netcat(openbsd or traditional), quvi (+ grep, awk, sed etc.).
+# Optional: mplayer omxplayer vlc firefox youtube-dl greasemonkey
+# apt-get install netcat-openbsd quvi youtube-dl mplayer2 xul-ext-greasemonkey
+#
+###############################################################################
+# Parameters
+
+declare -A PLAYER_OPTIONS=(
+['omxplayer']=$''                 # omxplayer options (for raspberry pi)
+['mpv']=$'-fs'                    # mpv options
+['mplayer']=$'-fs -really-quiet'  # mplayer options
+['vlc']=$''                       # vlc options
+)
+PLAYER=`which omxplayer mpv mplayer vlc | head -n 1`  # Pick the 1st detected player
+PLAYER="$PLAYER ${PLAYER_OPTIONS[$PLAYER]} < /tmp/noflash.ky.fifo 2>/dev/null"
+QUVI_OPTS="-f best"
+YTDL_OPTS="-f best"
+
+# For security, bind to localhost by default. If you want the server and client
+# to be on separate machines, set NOFLASH_SERVER to 0.0.0.0 or server's IP num.
+# These two parameters are parsed by bash and greasemonkey.
+# *///                       ## Active: bash, greasemonkey ##
+NOFLASH_SERVER="127.0.0.1"
+NOFLASH_PORT="9000"
+
+noflash_hide=""/*            ## Active: bash ##
+###############################################################################
+
+declare -A KEY_MAP=(['!8']=$'\b' ['!32']=' '
+['!33']=$'\x1b\x5b\x35\x7e' # pgup
+['!34']=$'\x1b\x5b\x36\x7e' # pgdn
+['!37']=$'\x1b\x5b\x44'     # left
+['!38']=$'\x1b\x5b\x41'     # up
+['!39']=$'\x1b\x5b\x43'     # right
+['!40']=$'\x1b\x5b\x42'     # down
+)
+
+echo "NoFlash  Copyright (C) 2013  Bilgehan Uygar Oztekin,  License: GPLv3"
+
+INFO="Watch online videos without flash using mplayer, quvi, youtube-dl etc.
+
+This script is a valid bash script, greasemonkey (gm) script, and an html page.
+- As a bash script, becomes a web server accepting the following request types:
+  - http[s]://*  -> Play a remote video extracted from URL.
+  - file:*       -> Play a file or browse a directory.
+  - key:*        -> Send key press to the player.
+- Server has a web interface to control the player, submit URLs, browse files,
+  or download a js bookmarklet or a gm script. Gm script pings the server with
+  visited http pages. Js bookmarklet sends the current page when clicked on.
+
+How to use it:
+- On server, run this as a bash script (e.g. bash `basename $0`).
+- On client (can be the same machine), go to http://$NOFLASH_SERVER:$NOFLASH_PORT
+  and install the javascript bookmarklet and/or the greasemonkey script.
+- With the gm script, videos from supported sites should start automatically as
+  you browse.  If you prefer to use the js bookmarklet, click on it to initiate.
+- Server binds to localhost only by default.  Change NOFLASH_SERVER to server's
+  IP to be able to access and remote control it from other computers (clients).
+- See http://www.cs.umn.edu/~oztekin/software/noflash for more information."
+
+echo -e "$INFO\n\nServer listening on http://$NOFLASH_SERVER:$NOFLASH_PORT"
+which youtube-dl &>/dev/null || which quvi &>/dev/null || \
+(echo -e "\nError: NoFlash requires youtube-dl and/or quvi but none were detected. Aborting.\n" && exit 0)
+
+# exec > >(tee /tmp/noflash.log)
+# exec 2>&1
+
+# Create the fifos we will use.
+NCFIFO=/tmp/noflash.nc.fifo && [ -p $NCFIFO ] || mkfifo $NCFIFO
+KYFIFO=/tmp/noflash.ky.fifo && [ -p $KYFIFO ] || mkfifo $KYFIFO
+trap "rm $NCFIFO $KYFIFO; kill -- -$$" EXIT
+
+YTDL_PAT=`youtube-dl --list-extractors 2>/dev/null | sort | grep -vE "vimeo|generic" | grep -v ':\|(' | awk '{printf"|%s",tolower($1)}' | sed 's/^|//g'`
+
+GM_PAT=`quvi --support | awk '{print $1}' | sed 's/|/\n/g;s/%\./\\./g;s/%w+/com/g' | awk '{printf "// @include /https?://(www.)%s/!/\\\\n",$1}' | sed 's/\./\\\\\\\./g;s#!#.\*#g'`
+
+function kill_players {
+  kill `timeout 2 fuser -w $KYFIFO` &>/dev/null || true;
+  rm $KYFIFO &>/dev/null ; mkfifo $KYFIFO; sleep 10000 > $KYFIFO&
+}
+
+KILL_PAGE="<html><script>setTimeout(\"location.replace('http://$NOFLASH_SERVER:$NOFLASH_PORT/');\",1000)</script>"
+
+# Start the web server
+PID=$$
+while true ; do
+  ( cat $NCFIFO ) | nc -l $NOFLASH_SERVER -p $NOFLASH_PORT | (
+    TYPE="plain" && DOC=""
+    REQ=`while read L && [ " " "<" "$L" ] ; do echo "$L" ; done`
+    URL=`echo "$REQ" | grep '^GET /' | awk '{print $2}' | sed 's#^/##g'`
+    URL=`echo -e $(echo "$URL" | sed -e's/%\([0-9A-F][0-9A-F]\)/\\\\\x\1/g')`
+    case $URL in
+      noflash.user.js) DOC=`cat $0 | sed "s#^%%GM_PAT%%#$GM_PAT#"`;;
+      key:*)
+        KEY=`echo "$URL" | sed 's/^key://g' `
+        MAP=$KEY; [ -n "${KEY_MAP[$KEY]}" ] && MAP="${KEY_MAP[$KEY]}"
+        [ -n "$KEY" ] && (echo -n "$MAP" > $KYFIFO &)
+        DOC="key: '$KEY'"
+        ;;
+      http://*|https://*)
+        if quvi --verbosity=mute --support $URL 2>/dev/null ; then
+          TYPE=DOC="1 (quvi) $URL" && kill_players && (quvi --verbosity=mute $QUVI_OPTS --exec "$PLAYER %u &>/dev/null" "$URL" &>/dev/null &)
+        elif echo "$URL" | grep -qE "$YTDL_PAT" ; then
+          VID=`youtube-dl -g $YTDL_OPTS "$URL" 2>/dev/null`
+          [ -n "$VID" ] && DOC="1 (ytdl) $URL" && kill_players && eval "$PLAYER \"$VID\" &>/dev/null &"
+        fi
+        TYPE="html" && DOC="$DOC $KILL_PAGE </html>"
+        ;;
+      file:*) VID="`echo $URL | sed 's#^file:##g'`"
+        [ -z "$VID" ] && VID=`pwd`
+        if [ -d "$VID" ] ; then
+          cd "$VID" && TYPE="html" && VID=`readlink -f "$VID"`
+          DOC=`cat $0 | sed 's/print_usage/0/g'`
+          DOC="$DOC<div align=left><table><th>$VID</th>"`(echo -ne "..\0" && find * -print0 -maxdepth 0) | xargs -0 -n 1 -I % echo "<tr><td><a href=\"/file:$VID/%\">%</a></td></tr>"`"</table></div>"
+        else
+          DOC="0 $URL" && [ -f "$VID" ] && kill_players && eval "$PLAYER \"$VID\" &>/dev/null &" && DOC="<script>window.history.back()</script>" && TYPE="html"
+        fi
+        ;;
+      exit|quit) kill -- -$PID ;;
+      *) TYPE="html" && DOC=`cat $0 | sed 's/print_usage/1/g'`
+        ;;
+    esac
+    [ -n "$DOC" ] && [ -n "$URL" ] && echo "$URL"
+
+    cat >$NCFIFO <<EOF
+HTTP/1.0 200 OK
+Cache-Control: private
+Content-Type: text/$TYPE
+Server: noflash/1.0
+Connection: Close
+Content-Length: ${#DOC}
+
+$DOC
+EOF
+  )
+done
+exit 0
+# *///                       ## Active: greasemonkey ##
+
+// ==UserScript==
+// @name NoFlash - Watch Online Videos with Mplayer
+// @namespace Bilgehan Uygar Oztekin
+%%GM_PAT%%
+// @grant none
+// ==/UserScript==
+
+//                           ## Active: greasemonkey + html ## --><script>
+function noflash_send(param) {
+  async = true;
+  noflash_ajax = new XMLHttpRequest();
+  noflash_ajax.open("GET", param, true);
+  if (document.getElementById("noflash_response") != null) {
+    noflash_ajax.onreadystatechange = function() {
+      if (noflash_ajax.readyState==4 && noflash_ajax.status==200) {
+        clearTimeout(noflash_send.timeout);
+        document.getElementById("noflash_response").innerHTML=noflash_ajax.responseText;
+        noflash_send.timeout = setTimeout('document.getElementById("noflash_response").innerHTML=""', 5000);
+      }
+    }
+  }
+  noflash_ajax.send();
+}
+// </script><!--             ## Active: greasemonkey ##
+
+if (window.top === window.self && !RegExp(NOFLASH_SERVER).test(window.location))
+  open("http://" + NOFLASH_SERVER + ":" + NOFLASH_PORT + "/" + window.location, "noflash");
+
+/*                           ## Active: html ## -->
+<script>var usage = document.body.innerHTML.match(/INFO="([^"]*)"/)[1];document.body.innerHTML="";</script>
+<script>function keypress(e){ if(e.ctrlKey)document.getElementById('key').focus();} document.onkeydown=keypress</script>
+<style>
+body { background-color:#fff; color:#000066; font-family:sans-serif,verdana,helvetica,arial; }
+table { box-shadow:1px 1px 1px #aaaaaa; padding:5px 5px 5px 5px; margin:5px; border:1px solid #BFBFBF; }
+input { box-shadow:1px 1px 1px #aaaaaa; }
+a { color:#000066; text-shadow: 1px 1px 1px #aaaaaa; }
+a:hover { color:#000066; background-color:#efefff; text-shadow: 2px 2px 4px #aaaaaa; }
+b { text-shadow: 1px 1px 1px #aaaaaa; }
+</style>
+<div align=left><table><tr><td>
+<input type="button" value="<--" onclick="noflash_send('/key:!34')">
+<input type="button" value="<-"  onclick="noflash_send('/key:!40')">
+<input type="button" value="<"   onclick="noflash_send('/key:!37')">
+<input type="button" value="||"  onclick="noflash_send('/key:!32')">
+<input type="button" value=">"   onclick="noflash_send('/key:!39')">
+<input type="button" value="->"  onclick="noflash_send('/key:!38')">
+<input type="button" value="-->" onclick="noflash_send('/key:!33')">
+<input type="button" value="[]"  onclick="noflash_send('/key:q')">
+</td><td>key:</td><td><input id="key" type="text" size=1 maxlength=1 onkeyup="var k=event.keyCode; noflash_send('/key:' + (k==8 || k>=32 && k<=40?'!'+k:this.value));this.value='';return false;">
+</td></tr><tr><td><script>
+var a = document.createElement('a'); a.href = window.location; var url = a.protocol + "//" + a.host + '/';
+document.write("<a href='javascript:void(open(\"" + url +"\"+window.location, \"noflash\"))' title='Bookmarklet'>noflash</a>");
+</script>
+<a href='/noflash.user.js' title='Greasemonkey script'>gm</a>
+<a href='/file:' title='Browse local filesystem'>browse</a> <a href='/'>help</a></center>
+</td><td><form style="display:inline" onsubmit="noflash_send('/' + document.getElementById('url').value);return false;">url:</td><td><input id="url" type="text" size="1"></form>
+</td></tr></table></div>
+<script>if (print_usage) document.write("<div align=left><table><tr><td><pre>" + usage + "</pre>" +
+"<a href='http://www.cs.umn.edu/~oztekin/software/noflash'>NoFLash</a>, " +
+"Copyright (C) 2013 <a href='http://www.cs.umn.edu/~oztekin'>Bilgehan Uygar Oztekin</a>, " +
+"License: <a href='http://www.gnu.org/licenses/gpl.html'>GPLv3</a></td></tr></table></div>");</script>
+<div id="noflash_response" style='position:absolute; bottom:0;'> </div>
+<!-- *///                    ## Active: none ## -->
